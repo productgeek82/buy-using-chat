@@ -1,0 +1,6 @@
+api_version = "2025-07"
+
+[[extensions]]
+type = "theme"
+name = "Chat Widget"
+handle = "chat-widget"

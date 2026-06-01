@@ -1,0 +1,498 @@
+{% comment %}
+  Chat Widget — floating storefront assistant.
+  Searches the catalog via MCP and creates a direct checkout (no cart) on Buy Now.
+  App Proxy path: /apps/chat-proxy  →  your Remix backend /api/chat
+{% endcomment %}
+
+<div id="buc-widget-root">
+  <!-- Floating toggle button -->
+  <button id="buc-toggle" aria-label="Open shop assistant">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2Z"
+            fill="currentColor"/>
+    </svg>
+  </button>
+
+  <!-- Chat panel -->
+  <div id="buc-panel" role="dialog" aria-modal="true"
+       aria-label="{{ block.settings.widget_title | escape }}" hidden>
+    <div id="buc-header">
+      <span>{{ block.settings.widget_title | escape }}</span>
+      <button id="buc-close" aria-label="Close">&#x2715;</button>
+    </div>
+
+    <div id="buc-messages"></div>
+
+    <form id="buc-form" autocomplete="off">
+      <input id="buc-input" type="text"
+             placeholder="{{ block.settings.placeholder | escape }}"
+             aria-label="Search for a product"
+             required />
+      <button type="submit">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+             xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" fill="currentColor"/>
+        </svg>
+      </button>
+    </form>
+  </div>
+</div>
+
+<style>
+  #buc-widget-root {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  #buc-toggle {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: {{ block.settings.accent_color }};
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0,0,0,.24);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform .15s ease, box-shadow .15s ease;
+    margin-left: auto;
+  }
+
+  #buc-toggle:hover {
+    transform: scale(1.06);
+    box-shadow: 0 6px 20px rgba(0,0,0,.3);
+  }
+
+  #buc-panel {
+    position: absolute;
+    bottom: 68px;
+    right: 0;
+    width: 340px;
+    max-height: 520px;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.18);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #buc-panel[hidden] { display: none; }
+
+  #buc-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    background: {{ block.settings.accent_color }};
+    color: #fff;
+    font-weight: 600;
+    font-size: 15px;
+  }
+
+  #buc-close {
+    background: none;
+    border: none;
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0 2px;
+  }
+
+  #buc-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    scroll-behavior: smooth;
+  }
+
+  .buc-bubble {
+    padding: 10px 13px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.45;
+    max-width: 86%;
+    word-wrap: break-word;
+  }
+
+  .buc-bubble.user {
+    background: {{ block.settings.accent_color }};
+    color: #fff;
+    align-self: flex-end;
+    border-bottom-right-radius: 4px;
+  }
+
+  .buc-bubble.bot {
+    background: #f2f2f7;
+    color: #111;
+    align-self: flex-start;
+    border-bottom-left-radius: 4px;
+  }
+
+  .buc-bubble.error {
+    background: #fff0f0;
+    color: #c00;
+    align-self: flex-start;
+    border: 1px solid #f8c8c8;
+  }
+
+  /* Product card */
+  .buc-card {
+    background: #fafafa;
+    border: 1px solid #e8e8e8;
+    border-radius: 12px;
+    padding: 12px;
+    display: flex;
+    gap: 10px;
+    align-self: flex-start;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .buc-card img {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  .buc-card-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .buc-card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #111;
+    line-height: 1.3;
+  }
+
+  .buc-card-price {
+    font-size: 13px;
+    color: #555;
+  }
+
+  .buc-buy-btn {
+    margin-top: 6px;
+    padding: 7px 12px;
+    background: {{ block.settings.accent_color }};
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    align-self: flex-start;
+    transition: opacity .15s;
+  }
+
+  .buc-buy-btn:hover { opacity: .85; }
+  .buc-buy-btn:disabled { opacity: .5; cursor: default; }
+
+  /* Typing indicator */
+  .buc-typing {
+    display: flex;
+    gap: 4px;
+    padding: 10px 13px;
+    background: #f2f2f7;
+    border-radius: 12px;
+    border-bottom-left-radius: 4px;
+    align-self: flex-start;
+  }
+
+  .buc-typing span {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #999;
+    animation: buc-bounce .9s infinite ease-in-out;
+  }
+
+  .buc-typing span:nth-child(2) { animation-delay: .15s; }
+  .buc-typing span:nth-child(3) { animation-delay: .30s; }
+
+  @keyframes buc-bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30%            { transform: translateY(-6px); }
+  }
+
+  #buc-form {
+    display: flex;
+    padding: 10px 12px;
+    gap: 8px;
+    border-top: 1px solid #eee;
+  }
+
+  #buc-input {
+    flex: 1;
+    border: 1px solid #ddd;
+    border-radius: 20px;
+    padding: 9px 14px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color .15s;
+  }
+
+  #buc-input:focus { border-color: {{ block.settings.accent_color }}; }
+
+  #buc-form button[type="submit"] {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: {{ block.settings.accent_color }};
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: opacity .15s;
+  }
+
+  #buc-form button[type="submit"]:hover { opacity: .85; }
+
+  @media (max-width: 420px) {
+    #buc-panel { width: calc(100vw - 32px); right: 0; }
+  }
+</style>
+
+<script>
+(function () {
+  "use strict";
+
+  // App Proxy path — must match what you configured in the Partner Dashboard.
+  var PROXY_PATH = "/apps/chat-proxy";
+
+  var toggle  = document.getElementById("buc-toggle");
+  var panel   = document.getElementById("buc-panel");
+  var closeBtn = document.getElementById("buc-close");
+  var messages = document.getElementById("buc-messages");
+  var form    = document.getElementById("buc-form");
+  var input   = document.getElementById("buc-input");
+
+  // ── Panel open / close ──────────────────────────────────────────────────
+  toggle.addEventListener("click", function () {
+    var isOpen = !panel.hidden;
+    panel.hidden = isOpen;
+    toggle.setAttribute("aria-expanded", String(!isOpen));
+    if (!isOpen) input.focus();
+  });
+
+  closeBtn.addEventListener("click", function () {
+    panel.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+  });
+
+  // ── Message helpers ──────────────────────────────────────────────────────
+  function addBubble(text, type) {
+    var el = document.createElement("div");
+    el.className = "buc-bubble " + type;
+    el.textContent = text;
+    messages.appendChild(el);
+    scrollDown();
+    return el;
+  }
+
+  function addTyping() {
+    var el = document.createElement("div");
+    el.className = "buc-typing";
+    el.innerHTML = "<span></span><span></span><span></span>";
+    messages.appendChild(el);
+    scrollDown();
+    return el;
+  }
+
+  function removeEl(el) {
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  }
+
+  function scrollDown() {
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  // ── Product card renderer ────────────────────────────────────────────────
+  function renderProductCard(product) {
+    /*
+      Expected product shape from search_shop_catalog (adjust to whatever
+      the MCP tool actually returns for your store):
+      {
+        title, variantId, price, currency, imageUrl, handle
+      }
+    */
+    var card = document.createElement("div");
+    card.className = "buc-card";
+
+    // Thumbnail (optional)
+    if (product.imageUrl || product.image || product.image_url) {
+      var img = document.createElement("img");
+      img.src = product.imageUrl || product.image || product.image_url;
+      img.alt = product.title || "";
+      card.appendChild(img);
+    }
+
+    var info = document.createElement("div");
+    info.className = "buc-card-info";
+
+    var title = document.createElement("div");
+    title.className = "buc-card-title";
+    title.textContent = product.title || "Product";
+    info.appendChild(title);
+
+    if (product.price !== undefined) {
+      var price = document.createElement("div");
+      price.className = "buc-card-price";
+      var currency = product.currency || product.currencyCode || "USD";
+      price.textContent = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: currency,
+      }).format(product.price);
+      info.appendChild(price);
+    }
+
+    var buyBtn = document.createElement("button");
+    buyBtn.className = "buc-buy-btn";
+    buyBtn.textContent = "Buy Now";
+
+    var variantId =
+      product.variantId ||
+      product.variant_id ||
+      product.merchandiseId ||
+      product.id;
+
+    buyBtn.addEventListener("click", function () {
+      if (!variantId) {
+        addBubble("Sorry, this product cannot be purchased right now.", "error");
+        return;
+      }
+      initiateCheckout(variantId, buyBtn);
+    });
+
+    info.appendChild(buyBtn);
+    card.appendChild(info);
+    messages.appendChild(card);
+    scrollDown();
+  }
+
+  // ── API calls ─────────────────────────────────────────────────────────────
+  async function proxyPost(body) {
+    var res = await fetch(PROXY_PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    var json = await res.json();
+    if (!res.ok) throw new Error(json.error || "Request failed");
+    return json;
+  }
+
+  // ── Search flow ──────────────────────────────────────────────────────────
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var query = input.value.trim();
+    if (!query) return;
+
+    input.value = "";
+    addBubble(query, "user");
+
+    var typing = addTyping();
+
+    try {
+      var data = await proxyPost({ intent: "search", query: query });
+      removeEl(typing);
+
+      if (data.message) {
+        addBubble(data.message, "bot");
+        return;
+      }
+
+      if (!data.products || data.products.length === 0) {
+        addBubble("No products found. Try a different search.", "bot");
+        return;
+      }
+
+      var countText =
+        data.products.length === 1
+          ? "Here's what I found:"
+          : "Here are " + data.products.length + " results:";
+      addBubble(countText, "bot");
+
+      data.products.forEach(function (p) {
+        renderProductCard(p);
+      });
+    } catch (err) {
+      removeEl(typing);
+      addBubble("Search failed: " + err.message, "error");
+    }
+  });
+
+  // ── Checkout flow ────────────────────────────────────────────────────────
+  async function initiateCheckout(variantId, btn) {
+    btn.disabled = true;
+    btn.textContent = "Creating checkout…";
+
+    var typing = addTyping();
+
+    try {
+      var data = await proxyPost({ intent: "checkout", variantId: variantId });
+      removeEl(typing);
+
+      if (!data.continueUrl) {
+        throw new Error("No checkout URL returned");
+      }
+
+      addBubble("Redirecting you to checkout…", "bot");
+      // Small delay so the user sees the message, then redirect.
+      setTimeout(function () {
+        window.location.href = data.continueUrl;
+      }, 600);
+    } catch (err) {
+      removeEl(typing);
+      btn.disabled = false;
+      btn.textContent = "Buy Now";
+      addBubble("Checkout failed: " + err.message, "error");
+    }
+  }
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Chat Widget",
+  "target": "body",
+  "settings": [
+    {
+      "type": "text",
+      "id": "widget_title",
+      "label": "Widget title",
+      "default": "Shop Assistant"
+    },
+    {
+      "type": "text",
+      "id": "placeholder",
+      "label": "Input placeholder",
+      "default": "Search for a product…"
+    },
+    {
+      "type": "color",
+      "id": "accent_color",
+      "label": "Accent color",
+      "default": "#1a1a2e"
+    }
+  ]
+}
+{% endschema %}
