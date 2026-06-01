@@ -99,36 +99,49 @@ async function handleCheckout(storefront, variantId) {
 }
 
 // ---------------------------------------------------------------------------
-// Remix action — entry point for App Proxy POST requests
+// Loader — handles GET requests from the App Proxy health check
+// ---------------------------------------------------------------------------
+export const loader = async ({ request }) => {
+  await authenticate.public.appProxy(request);
+  return Response.json({ status: "ok" });
+};
+
+// ---------------------------------------------------------------------------
+// Action — entry point for App Proxy POST requests
 // ---------------------------------------------------------------------------
 export const action = async ({ request }) => {
-  const { storefront } = await authenticate.public.appProxy(request);
-
-  let body;
   try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: "Request body must be JSON" }, { status: 400 });
-  }
+    const { storefront } = await authenticate.public.appProxy(request);
 
-  const { intent, query, variantId } = body;
-
-  if (intent === "search") {
-    if (!query || typeof query !== "string") {
-      return Response.json({ error: "`query` string is required" }, { status: 400 });
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "Request body must be JSON" }, { status: 400 });
     }
-    return handleSearch(storefront, query.trim());
-  }
 
-  if (intent === "checkout") {
-    if (!variantId || typeof variantId !== "string") {
-      return Response.json({ error: "`variantId` string is required" }, { status: 400 });
+    const { intent, query, variantId } = body;
+
+    if (intent === "search") {
+      if (!query || typeof query !== "string") {
+        return Response.json({ error: "`query` string is required" }, { status: 400 });
+      }
+      return handleSearch(storefront, query.trim());
     }
-    return handleCheckout(storefront, variantId);
-  }
 
-  return Response.json(
-    { error: `Unknown intent "${intent}". Expected "search" or "checkout".` },
-    { status: 400 }
-  );
+    if (intent === "checkout") {
+      if (!variantId || typeof variantId !== "string") {
+        return Response.json({ error: "`variantId` string is required" }, { status: 400 });
+      }
+      return handleCheckout(storefront, variantId);
+    }
+
+    return Response.json(
+      { error: `Unknown intent "${intent}". Expected "search" or "checkout".` },
+      { status: 400 }
+    );
+  } catch (err) {
+    console.error("api.chat error:", err);
+    return Response.json({ error: err?.message ?? "Internal server error" }, { status: 500 });
+  }
 };
