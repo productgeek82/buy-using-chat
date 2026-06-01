@@ -1,134 +1,108 @@
 import { authenticate } from "../shopify.server";
 
-const STORE_MCP_URL = "https://roy-test-scores.myshopify.com/api/mcp";
+// ---------------------------------------------------------------------------
+// Product search via Storefront API
+// ---------------------------------------------------------------------------
+const SEARCH_QUERY = `#graphql
+  query searchProducts($query: String!) {
+    search(query: $query, types: PRODUCT, first: 5) {
+      edges {
+        node {
+          ... on Product {
+            id
+            title
+            handle
+            featuredImage { url altText }
+            priceRange {
+              minVariantPrice { amount currencyCode }
+            }
+            variants(first: 1) {
+              edges {
+                node {
+                  id
+                  availableForSale
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
 
-// UCP profile URL — the App Proxy public surface of this app.
-// Swap for your real tunnel/production URL once deployed.
-const UCP_PROFILE_URL =
-  process.env.SHOPIFY_APP_URL
-    ? `${process.env.SHOPIFY_APP_URL}/apps/chat-proxy`
-    : "https://roy-test-scores.myshopify.com/apps/chat-proxy";
-
-/**
- * POST a single JSON-RPC 2.0 call to the store's MCP endpoint and return
- * the parsed response. Throws if the HTTP layer itself fails.
- */
-async function callMcp(payload) {
-  const res = await fetch(STORE_MCP_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+async function handleSearch(storefront, query) {
+  const data = await storefront.graphql(SEARCH_QUERY, {
+    variables: { query },
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 300)}`);
+  const { search } = await data.json();
+  const edges = search?.edges ?? [];
+
+  if (edges.length === 0) {
+    return Response.json({ products: [], message: "No products found. Try a different search." });
   }
 
-  return res.json();
-}
-
-/**
- * Pull the first text block out of an MCP tools/call result and try to
- * JSON-parse it. Returns { parsed, raw } — parsed is null if it isn't JSON.
- */
-function extractContent(mcpResponse) {
-  const content = mcpResponse?.result?.content ?? [];
-  const raw = content.find((c) => c.type === "text")?.text ?? "";
-  try {
-    return { parsed: JSON.parse(raw), raw };
-  } catch {
-    return { parsed: null, raw };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Catalog search
-// ---------------------------------------------------------------------------
-async function handleSearch(query) {
-  const mcpResponse = await callMcp({
-    jsonrpc: "2.0",
-    id: "search-1",
-    method: "tools/call",
-    params: {
-      name: "search_shop_catalog",
-      arguments: { query },
-    },
+  const products = edges.map(({ node }) => {
+    const variant = node.variants?.edges?.[0]?.node;
+    const price = node.priceRange?.minVariantPrice;
+    return {
+      title: node.title,
+      handle: node.handle,
+      variantId: variant?.id ?? null,
+      availableForSale: variant?.availableForSale ?? false,
+      price: price ? parseFloat(price.amount) : null,
+      currency: price?.currencyCode ?? "USD",
+      imageUrl: node.featuredImage?.url ?? null,
+    };
   });
 
-  const { parsed, raw } = extractContent(mcpResponse);
-
-  // MCP may return an array of products or a single product object.
-  if (parsed) {
-    const products = Array.isArray(parsed) ? parsed : [parsed];
-    return Response.json({ products });
-  }
-
-  // Tool returned prose (no structured products found).
-  return Response.json({ products: [], message: raw });
+  return Response.json({ products });
 }
 
 // ---------------------------------------------------------------------------
-// Direct checkout — skips cart entirely via the Checkout MCP tool.
+// Checkout via Storefront Cart API
 // ---------------------------------------------------------------------------
-async function handleCheckout(variantId) {
-  const mcpResponse = await callMcp({
-    jsonrpc: "2.0",
-    id: "checkout-1",
-    method: "tools/call",
-    params: {
-      // _meta is mandatory for UCP-aware checkout agents.
-      _meta: { profile: UCP_PROFILE_URL },
-      name: "create_checkout",
-      arguments: {
-        // Shopify Checkout MCP expects the Storefront GID for the variant.
-        line_items: [{ merchandiseId: variantId, quantity: 1 }],
-      },
-    },
+const CREATE_CART_MUTATION = `#graphql
+  mutation cartCreate($variantId: ID!) {
+    cartCreate(input: {
+      lines: [{ merchandiseId: $variantId, quantity: 1 }]
+    }) {
+      cart {
+        checkoutUrl
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+async function handleCheckout(storefront, variantId) {
+  const data = await storefront.graphql(CREATE_CART_MUTATION, {
+    variables: { variantId },
   });
 
-  if (mcpResponse?.result?.isError) {
+  const { cartCreate } = await data.json();
+
+  if (cartCreate?.userErrors?.length > 0) {
     return Response.json(
-      { error: "MCP reported an error", detail: mcpResponse.result },
-      { status: 502 }
+      { error: cartCreate.userErrors.map((e) => e.message).join(", ") },
+      { status: 400 }
     );
   }
 
-  const { parsed, raw } = extractContent(mcpResponse);
-
-  // The checkout URL may live under several different key names depending on
-  // the MCP server version — check all plausible locations.
-  const continueUrl =
-    parsed?.continue_url ??
-    parsed?.checkoutUrl ??
-    parsed?.checkout_url ??
-    parsed?.webUrl ??
-    mcpResponse?.result?.checkoutUrl ??
-    null;
-
+  const continueUrl = cartCreate?.cart?.checkoutUrl;
   if (!continueUrl) {
-    return Response.json(
-      {
-        error:
-          "No checkout URL found in MCP response. " +
-          "Inspect `raw` and adjust key extraction above.",
-        raw,
-        mcpResponse,
-      },
-      { status: 502 }
-    );
+    return Response.json({ error: "Could not create checkout." }, { status: 502 });
   }
 
   return Response.json({ continueUrl });
 }
 
 // ---------------------------------------------------------------------------
-// Remix action — entry point for the App Proxy POST requests.
+// Remix action — entry point for App Proxy POST requests
 // ---------------------------------------------------------------------------
 export const action = async ({ request }) => {
-  // Validates the Shopify HMAC signature injected by the App Proxy.
-  // Throws a 401 Response automatically if the signature is invalid.
-  await authenticate.public.appProxy(request);
+  const { storefront } = await authenticate.public.appProxy(request);
 
   let body;
   try {
@@ -143,17 +117,14 @@ export const action = async ({ request }) => {
     if (!query || typeof query !== "string") {
       return Response.json({ error: "`query` string is required" }, { status: 400 });
     }
-    return handleSearch(query.trim());
+    return handleSearch(storefront, query.trim());
   }
 
   if (intent === "checkout") {
     if (!variantId || typeof variantId !== "string") {
-      return Response.json(
-        { error: "`variantId` (Storefront GID) string is required" },
-        { status: 400 }
-      );
+      return Response.json({ error: "`variantId` string is required" }, { status: 400 });
     }
-    return handleCheckout(variantId);
+    return handleCheckout(storefront, variantId);
   }
 
   return Response.json(
