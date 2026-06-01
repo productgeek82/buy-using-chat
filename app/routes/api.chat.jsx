@@ -1,7 +1,49 @@
+import Anthropic from "@anthropic-ai/sdk";
 import { authenticate } from "../shopify.server";
 
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const SYSTEM = `You are a helpful shopping assistant for this Shopify store. \
+Help customers find products using the search_products tool. \
+When a customer wants to buy a product, use create_checkout to generate a checkout URL. \
+Be concise and friendly. Always search before recommending products.`;
+
+// MCP-style tools Claude uses to interact with the Shopify catalog
+const TOOLS = [
+  {
+    name: "search_products",
+    description:
+      "Search the Shopify store catalog for products matching a query. Returns titles, prices, images, and variant IDs.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Product search query (e.g. 'blue cotton t-shirt', 'running shoes')",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "create_checkout",
+    description:
+      "Create a direct checkout URL for a specific product variant. Use only when the customer explicitly wants to buy.",
+    input_schema: {
+      type: "object",
+      properties: {
+        variantId: {
+          type: "string",
+          description: "Shopify variant GID (e.g. gid://shopify/ProductVariant/123456789)",
+        },
+      },
+      required: ["variantId"],
+    },
+  },
+];
+
 // ---------------------------------------------------------------------------
-// Product search via Storefront API
+// Storefront API helpers
 // ---------------------------------------------------------------------------
 const SEARCH_QUERY = `#graphql
   query searchProducts($query: String!) {
@@ -17,12 +59,7 @@ const SEARCH_QUERY = `#graphql
               minVariantPrice { amount currencyCode }
             }
             variants(first: 1) {
-              edges {
-                node {
-                  id
-                  availableForSale
-                }
-              }
+              edges { node { id availableForSale } }
             }
           }
         }
@@ -31,19 +68,22 @@ const SEARCH_QUERY = `#graphql
   }
 `;
 
-async function handleSearch(storefront, query) {
-  const data = await storefront.graphql(SEARCH_QUERY, {
-    variables: { query },
-  });
-
-  const { search } = await data.json();
-  const edges = search?.edges ?? [];
-
-  if (edges.length === 0) {
-    return Response.json({ products: [], message: "No products found. Try a different search." });
+const CART_MUTATION = `#graphql
+  mutation cartCreate($variantId: ID!) {
+    cartCreate(input: {
+      lines: [{ merchandiseId: $variantId, quantity: 1 }]
+    }) {
+      cart { checkoutUrl }
+      userErrors { field message }
+    }
   }
+`;
 
-  const products = edges.map(({ node }) => {
+async function searchProducts(storefront, query) {
+  const res = await storefront.graphql(SEARCH_QUERY, { variables: { query } });
+  const { search } = await res.json();
+
+  return (search?.edges ?? []).map(({ node }) => {
     const variant = node.variants?.edges?.[0]?.node;
     const price = node.priceRange?.minVariantPrice;
     return {
@@ -56,57 +96,99 @@ async function handleSearch(storefront, query) {
       imageUrl: node.featuredImage?.url ?? null,
     };
   });
-
-  return Response.json({ products });
 }
 
-// ---------------------------------------------------------------------------
-// Checkout via Storefront Cart API
-// ---------------------------------------------------------------------------
-const CREATE_CART_MUTATION = `#graphql
-  mutation cartCreate($variantId: ID!) {
-    cartCreate(input: {
-      lines: [{ merchandiseId: $variantId, quantity: 1 }]
-    }) {
-      cart {
-        checkoutUrl
-      }
-      userErrors { field message }
-    }
-  }
-`;
-
-async function handleCheckout(storefront, variantId) {
-  const data = await storefront.graphql(CREATE_CART_MUTATION, {
-    variables: { variantId },
-  });
-
-  const { cartCreate } = await data.json();
+async function createCheckout(storefront, variantId) {
+  const res = await storefront.graphql(CART_MUTATION, { variables: { variantId } });
+  const { cartCreate } = await res.json();
 
   if (cartCreate?.userErrors?.length > 0) {
-    return Response.json(
-      { error: cartCreate.userErrors.map((e) => e.message).join(", ") },
-      { status: 400 }
-    );
+    throw new Error(cartCreate.userErrors.map((e) => e.message).join(", "));
   }
 
-  const continueUrl = cartCreate?.cart?.checkoutUrl;
-  if (!continueUrl) {
-    return Response.json({ error: "Could not create checkout." }, { status: 502 });
-  }
-
-  return Response.json({ continueUrl });
+  return { checkoutUrl: cartCreate?.cart?.checkoutUrl ?? null };
 }
 
 // ---------------------------------------------------------------------------
-// Loader — handles GET requests (App Proxy health check / browser navigation)
+// Agentic loop — Claude calls tools until it has a final text response
 // ---------------------------------------------------------------------------
-export const loader = async () => {
-  return Response.json({ status: "ok" });
-};
+async function runAgenticLoop(storefront, messages) {
+  const foundProducts = [];
+  let checkoutUrl = null;
+  let currentMessages = messages;
+
+  let response = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1024,
+    system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+    messages: currentMessages,
+    tools: TOOLS,
+  });
+
+  while (response.stop_reason === "tool_use") {
+    const toolResults = [];
+
+    for (const block of response.content) {
+      if (block.type !== "tool_use") continue;
+
+      try {
+        if (block.name === "search_products") {
+          const products = await searchProducts(storefront, block.input.query);
+          foundProducts.push(...products);
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(products),
+          });
+        } else if (block.name === "create_checkout") {
+          const result = await createCheckout(storefront, block.input.variantId);
+          checkoutUrl = result.checkoutUrl;
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(result),
+          });
+        }
+      } catch (err) {
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: JSON.stringify({ error: err.message }),
+          is_error: true,
+        });
+      }
+    }
+
+    currentMessages = [
+      ...currentMessages,
+      { role: "assistant", content: response.content },
+      { role: "user", content: toolResults },
+    ];
+
+    response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+      messages: currentMessages,
+      tools: TOOLS,
+    });
+  }
+
+  const reply = response.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+
+  return { reply, products: foundProducts, checkoutUrl };
+}
 
 // ---------------------------------------------------------------------------
-// Action — entry point for App Proxy POST requests
+// Loader — GET health check for App Proxy
+// ---------------------------------------------------------------------------
+export const loader = async () => Response.json({ status: "ok" });
+
+// ---------------------------------------------------------------------------
+// Action — App Proxy POST entry point
 // ---------------------------------------------------------------------------
 export const action = async ({ request }) => {
   try {
@@ -119,28 +201,25 @@ export const action = async ({ request }) => {
       return Response.json({ error: "Request body must be JSON" }, { status: 400 });
     }
 
-    const { intent, query, variantId } = body;
-
-    if (intent === "search") {
-      if (!query || typeof query !== "string") {
-        return Response.json({ error: "`query` string is required" }, { status: 400 });
+    // Direct checkout (Buy Now button — no LLM needed)
+    if (body.intent === "checkout") {
+      if (!body.variantId) {
+        return Response.json({ error: "variantId required" }, { status: 400 });
       }
-      return handleSearch(storefront, query.trim());
+      const result = await createCheckout(storefront, body.variantId);
+      return Response.json({ continueUrl: result.checkoutUrl });
     }
 
-    if (intent === "checkout") {
-      if (!variantId || typeof variantId !== "string") {
-        return Response.json({ error: "`variantId` string is required" }, { status: 400 });
-      }
-      return handleCheckout(storefront, variantId);
+    // Chat — send messages to Claude with Shopify tools
+    const { messages } = body;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return Response.json({ error: "messages array is required" }, { status: 400 });
     }
 
-    return Response.json(
-      { error: `Unknown intent "${intent}". Expected "search" or "checkout".` },
-      { status: 400 }
-    );
+    const result = await runAgenticLoop(storefront, messages);
+    return Response.json(result);
   } catch (err) {
     console.error("api.chat error:", err);
-    return Response.json({ error: err?.message ?? "Internal server error" }, { status: 500 });
+    return Response.json({ error: err?.message ?? "Internal error" }, { status: 500 });
   }
 };
