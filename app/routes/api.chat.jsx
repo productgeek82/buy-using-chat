@@ -99,10 +99,9 @@ async function handleCheckout(storefront, variantId) {
 }
 
 // ---------------------------------------------------------------------------
-// Loader — handles GET requests from the App Proxy health check
+// Loader — handles GET requests (App Proxy health check / browser navigation)
 // ---------------------------------------------------------------------------
-export const loader = async ({ request }) => {
-  await authenticate.public.appProxy(request);
+export const loader = async () => {
   return Response.json({ status: "ok" });
 };
 
